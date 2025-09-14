@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
+import requests
 import firebase_admin
 from firebase_admin import credentials, auth, firestore
 from datetime import datetime, timedelta
@@ -73,16 +74,16 @@ async def verify_token(authorization: str = Header(None)):
         logger.warning("Running in development mode - token verification bypassed")
         return {"uid": "dev_user", "email": "dev@example.com"}
 
-def generate_sample_data(symbol: str, period: str, interval: str):
+def generate_sample_data(symbol: str, period: str, interval: str, from_date: str = None, to_date: str = None):
     """Generate realistic sample data when yfinance fails"""
     print(f"Generating sample data for {symbol}")
-    
+
     # Base prices for different symbols
     base_prices = {
         'AAPL': 175.0,
-        'GOOGL': 2800.0,
+        'GOOGL': 138.0,
         'MSFT': 340.0,
-        'AMZN': 3200.0,
+        'AMZN': 155.0,
         'TSLA': 250.0,
         'NVDA': 450.0,
         'META': 320.0,
@@ -90,77 +91,100 @@ def generate_sample_data(symbol: str, period: str, interval: str):
         'SPY': 450.0,
         'QQQ': 380.0
     }
-    
+
     base_price = base_prices.get(symbol.upper(), 100.0)
-    
-    # Determine number of data points based on period and interval
-    data_points = 30  # Default
-    if period == '1d' and interval == '1m':
-        data_points = 390  # 6.5 hours * 60 1-minute intervals
-    elif period == '1d' and interval == '5m':
-        data_points = 78   # 6.5 hours * 12 5-minute intervals
-    elif period == '1d':
-        data_points = 78
-    elif period == '5d' and interval == '5m':
-        data_points = 390  # 5 days * 78 intervals per day
-    elif period == '5d':
-        data_points = 390
-    elif period == '1mo':
-        data_points = 30
-    elif period == '3mo':
-        data_points = 90
-    elif period == '1y':
-        data_points = 252
-    
-    # Generate timestamps
-    now = datetime.now()
-    if interval == '1m':
-        timestamps = [now - timedelta(minutes=i) for i in range(data_points)]
-    elif interval == '5m':
-        timestamps = [now - timedelta(minutes=5*i) for i in range(data_points)]
-    elif interval == '15m':
-        timestamps = [now - timedelta(minutes=15*i) for i in range(data_points)]
-    elif interval == '1h':
-        timestamps = [now - timedelta(hours=i) for i in range(data_points)]
-    else:  # daily
-        timestamps = [now - timedelta(days=i) for i in range(data_points)]
-    
-    timestamps.reverse()  # oldest to newest
-    
+
+    # Handle custom date range
+    if from_date and to_date:
+        try:
+            start_date = datetime.fromisoformat(from_date.replace('Z', ''))
+            end_date = datetime.fromisoformat(to_date.replace('Z', ''))
+            days_diff = (end_date - start_date).days
+
+            if interval == '1d':
+                data_points = min(days_diff, 365)  # Max 1 year
+                timestamps = [start_date + timedelta(days=i) for i in range(data_points)]
+            elif interval == '1h':
+                data_points = min(days_diff * 24, 365 * 24)  # Max 1 year hourly
+                timestamps = [start_date + timedelta(hours=i) for i in range(data_points)]
+            else:
+                data_points = min(days_diff, 365)
+                timestamps = [start_date + timedelta(days=i) for i in range(data_points)]
+        except:
+            # Fallback to period-based calculation
+            from_date = to_date = None
+
+    if not from_date or not to_date:
+        # Determine number of data points based on period and interval
+        data_points = 30  # Default
+        if period == '1d' and interval == '1m':
+            data_points = 390  # 6.5 hours * 60 1-minute intervals
+        elif period == '1d':
+            data_points = 78
+        elif period == '5d':
+            data_points = 5
+        elif period == '1mo' or period == '1M':
+            data_points = 30
+        elif period == '3mo' or period == '3M':
+            data_points = 90
+        elif period == '6mo' or period == '6M':
+            data_points = 180
+        elif period == '1y' or period == '1Y':
+            data_points = 252
+        elif period == '2y' or period == '2Y':
+            data_points = 504
+        elif period == '5y' or period == '5Y':
+            data_points = 1260
+
+        # Generate timestamps
+        now = datetime.now()
+        if interval == '1m':
+            timestamps = [now - timedelta(minutes=i) for i in range(data_points)]
+        elif interval == '5m':
+            timestamps = [now - timedelta(minutes=5*i) for i in range(data_points)]
+        elif interval == '15m':
+            timestamps = [now - timedelta(minutes=15*i) for i in range(data_points)]
+        elif interval == '1h':
+            timestamps = [now - timedelta(hours=i) for i in range(data_points)]
+        else:  # daily
+            timestamps = [now - timedelta(days=i) for i in range(data_points)]
+
+        timestamps.reverse()  # oldest to newest
+
     # Generate realistic stock data using random walk
     np.random.seed(hash(symbol) % 2**32)  # Consistent seed per symbol
-    
+
     prices = []
     volumes = []
     current_price = base_price
-    
+
     for i in range(data_points):
         # Random walk with slight upward trend
         change_percent = np.random.normal(0.001, 0.02)  # 0.1% mean, 2% std
         current_price *= (1 + change_percent)
-        
+
         # Ensure reasonable bounds
         current_price = max(current_price, base_price * 0.5)
         current_price = min(current_price, base_price * 2.0)
-        
+
         prices.append(current_price)
-        
+
         # Generate volume (higher volume on bigger price changes)
         base_volume = 1000000 + hash(symbol + str(i)) % 5000000
         volume_multiplier = 1 + abs(change_percent) * 10
         volumes.append(int(base_volume * volume_multiplier))
-    
+
     # Generate OHLC data
     ohlc_data = []
     for i, price in enumerate(prices):
         # Generate realistic OHLC around the close price
         volatility = 0.005  # 0.5% intraday volatility
-        
+
         open_price = price * (1 + np.random.normal(0, volatility))
         high_price = max(open_price, price) * (1 + abs(np.random.normal(0, volatility)))
         low_price = min(open_price, price) * (1 - abs(np.random.normal(0, volatility)))
         close_price = price
-        
+
         ohlc_data.append({
             'open': round(open_price, 2),
             'high': round(high_price, 2),
@@ -168,7 +192,7 @@ def generate_sample_data(symbol: str, period: str, interval: str):
             'close': round(close_price, 2),
             'volume': volumes[i]
         })
-    
+
     return {
         'timestamps': [int(ts.timestamp() * 1000) for ts in timestamps],
         'open': [d['open'] for d in ohlc_data],
@@ -178,16 +202,17 @@ def generate_sample_data(symbol: str, period: str, interval: str):
         'volume': [d['volume'] for d in ohlc_data]
     }
 
-@lru_cache(maxsize=100)
-def get_stock_data(symbols: str, period: str, interval: str):
+
+def get_stock_data(symbols: str, period: str, interval: str, from_date: str = None, to_date: str = None):
     symbol_list = symbols.split(',')
     
     # Map periods to yfinance format
     period_map = {
-        '1D': '1d', '5D': '5d', '1W': '5d', '1M': '1mo', 
-        '3M': '3mo', '1Y': '1y', 'YTD': 'ytd', 'MTD': '1mo'
+        '1D': '1d', '5D': '5d', '1W': '5d', '1M': '1mo',
+        '3M': '3mo', '6M': '6mo', '1Y': '1y', '2Y': '2y', '5Y': '5y',
+        'YTD': 'ytd', 'MTD': '1mo'
     }
-    
+
     # Map intervals based on period for optimal data granularity
     interval_map = {
         '1D': '1m',   # 1-minute intervals for intraday
@@ -195,7 +220,10 @@ def get_stock_data(symbols: str, period: str, interval: str):
         '1W': '15m',  # 15-minute intervals for 1 week
         '1M': '1h',   # 1-hour intervals for 1 month
         '3M': '1d',   # Daily intervals for 3 months
+        '6M': '1d',   # Daily intervals for 6 months
         '1Y': '1d',   # Daily intervals for 1 year
+        '2Y': '1d',   # Daily intervals for 2 years
+        '5Y': '1d',   # Daily intervals for 5 years
         'YTD': '1d',  # Daily intervals for YTD
         'MTD': '1h'   # Hourly intervals for MTD
     }
@@ -209,12 +237,12 @@ def get_stock_data(symbols: str, period: str, interval: str):
         # Try with different approaches for yfinance
         data = None
         
-        # Method 1: Standard download
+        # Method 1: Standard download (let yfinance handle sessions)
         try:
             data = yf.download(
-                symbol_list, 
-                period=yf_period, 
-                interval=yf_interval, 
+                symbol_list,
+                period=yf_period,
+                interval=yf_interval,
                 group_by='ticker',
                 auto_adjust=True,
                 prepost=True,
@@ -257,22 +285,23 @@ def get_stock_data(symbols: str, period: str, interval: str):
             try:
                 if len(symbol_list) == 1:
                     df = data
+                    # For single symbol, flatten multi-level columns if they exist
+                    if hasattr(df, 'columns') and isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.droplevel(0)
                 else:
                     df = data.get(symbol) if isinstance(data, dict) else data[symbol]
                 
                 if df is None or df.empty:
                     print(f"No data available for {symbol}, using sample data")
-                    # Use sample data instead of empty arrays
-                    result[symbol] = generate_sample_data(symbol, yf_period, yf_interval)
+                    result[symbol] = generate_sample_data(symbol, yf_period, yf_interval, from_date, to_date)
                     continue
                 
                 df = df.dropna()
                 print(f"Processing {symbol}: {len(df)} rows after dropna")
                 
                 if len(df) == 0:
-                    # Use sample data if no data after cleaning
                     print(f"No data after cleaning for {symbol}, using sample data")
-                    result[symbol] = generate_sample_data(symbol, yf_period, yf_interval)
+                    result[symbol] = generate_sample_data(symbol, yf_period, yf_interval, from_date, to_date)
                 else:
                     result[symbol] = {
                         'timestamps': [int(ts.timestamp() * 1000) for ts in df.index],
@@ -286,22 +315,23 @@ def get_stock_data(symbols: str, period: str, interval: str):
                     
             except Exception as e:
                 print(f"Error processing {symbol}: {e}, using sample data")
-                # Use sample data for failed symbols
-                result[symbol] = generate_sample_data(symbol, yf_period, yf_interval)
+                result[symbol] = generate_sample_data(symbol, yf_period, yf_interval, from_date, to_date)
         
         return result
     except Exception as e:
         print(f"Fatal error in get_stock_data: {e}, using sample data for all symbols")
-        # Instead of returning empty data, return sample data for all symbols
+        logger.error(f"Fatal error fetching stock data: {e}")
         result = {}
         for symbol in symbol_list:
-            result[symbol] = generate_sample_data(symbol, yf_period, yf_interval)
+            result[symbol] = generate_sample_data(symbol, yf_period, yf_interval, from_date, to_date)
         return result
 
 @app.get("/api/stocks")
 async def get_stocks(
     symbols: str,
     range: str = "1M",
+    from_date: str = None,
+    to_date: str = None,
     user: dict = Depends(verify_token)
 ):
     # Log user activity if Firebase is enabled
@@ -309,12 +339,14 @@ async def get_stocks(
         try:
             await log_user_activity(user['uid'], 'stock_data_fetch', {
                 'symbols': symbols,
-                'range': range
+                'range': range,
+                'from_date': from_date,
+                'to_date': to_date
             })
         except Exception as e:
             logger.error(f"Failed to log user activity: {e}")
     
-    return get_stock_data(symbols, range, "")
+    return get_stock_data(symbols, range, "", from_date, to_date)
 
 @app.get("/api/profile")
 async def get_user_profile(user: dict = Depends(verify_token)):

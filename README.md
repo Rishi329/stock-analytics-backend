@@ -472,5 +472,3 @@ This project is licensed under the MIT License.
 - [yfinance Documentation](https://pypi.org/project/yfinance/)
 
 ---
-
-**🤖 Built with AI assistance using Claude Code**
